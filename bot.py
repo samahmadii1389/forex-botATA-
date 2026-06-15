@@ -3,6 +3,7 @@ import logging
 import os
 import xml.etree.ElementTree as ET
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 import httpx
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -16,7 +17,9 @@ FF_RSS_URL  = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
 IMPACT_FILTER = {"High", "Medium"}   # قرمز = High | نارنجی = Medium
 CURRENCY_FILTER = "USD"
 
-SEND_HOUR   = 7    # ساعت ارسال (به وقت سرور)
+TEHRAN_TZ   = ZoneInfo("Asia/Tehran")
+
+SEND_HOUR   = 7    # ساعت ارسال (به وقت ایران)
 SEND_MINUTE = 0
 
 logging.basicConfig(
@@ -37,7 +40,7 @@ async def fetch_news() -> list[dict]:
         resp.raise_for_status()
 
     root = ET.fromstring(resp.text)
-    today = date.today()
+    today = datetime.now(TEHRAN_TZ).date()
     events = []
 
     for item in root.findall(".//event"):
@@ -81,12 +84,13 @@ async def fetch_news() -> list[dict]:
 
 # ─── ساخت پیام تلگرام ────────────────────────────────────
 def build_message(events: list[dict]) -> str:
-    today_fa = datetime.now().strftime("%Y/%m/%d")
+    now = datetime.now(TEHRAN_TZ)
+    today_fa = now.strftime("%Y/%m/%d")
     weekday_map = {
         "Monday": "دوشنبه", "Tuesday": "سه‌شنبه", "Wednesday": "چهارشنبه",
         "Thursday": "پنج‌شنبه", "Friday": "جمعه",
     }
-    weekday_en = datetime.now().strftime("%A")
+    weekday_en = now.strftime("%A")
     weekday_fa = weekday_map.get(weekday_en, weekday_en)
 
     lines = [
@@ -131,8 +135,20 @@ async def send_daily_news():
 # ─── زمان‌بندی ────────────────────────────────────────────
 async def scheduler():
     log.info("🤖 ربات شروع به کار کرد...")
+
+    # ─── پیام تست هنگام روشن شدن ───────────────────────────
+    try:
+        bot = Bot(token=BOT_TOKEN)
+        await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text="✅ ربات با موفقیت روشن شد و در حال کار است.",
+        )
+        log.info("✅ پیام تست ارسال شد.")
+    except Exception as e:
+        log.error(f"❌ خطا در ارسال پیام تست: {e}")
+
     while True:
-        now = datetime.now()
+        now = datetime.now(TEHRAN_TZ)
         weekday = now.weekday()   # 0=Mon … 4=Fri
 
         # فقط دوشنبه تا جمعه (0-4)
