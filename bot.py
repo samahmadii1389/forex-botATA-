@@ -1,164 +1,80 @@
-import asyncio
-import logging
 import os
-import xml.etree.ElementTree as ET
-from datetime import datetime
-from zoneinfo import ZoneInfo
-import httpx
-from telegram import Bot
-from telegram.constants import ParseMode
+import requests
+from datetime import datetime, timezone, timedelta
 
-# Settings
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-CHANNEL_ID     = os.getenv("CHANNEL_ID", "@your_channel_username")
-FF_RSS_URL     = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-IMPACT_FILTER  = {"High", "Medium"}
-CURRENCY_FILTER = "USD"
-TEHRAN_TZ      = ZoneInfo("Asia/Tehran")
-ET_TZ          = ZoneInfo("America/New_York")
-SEND_HOUR      = 7   # Tehran time
-SEND_MINUTE    = 0
+# ---------- تنظیمات ----------
+FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-log = logging.getLogger(__name__)
+IMPACT_EMOJI = {
+    "High": "🔴",
+    "Medium": "🟠",
+}
 
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    resp = requests.post(url, data={
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }, timeout=15)
+    resp.raise_for_status()
 
-def to_tehran_time(time_str: str, event_date) -> str:
-    """Convert Forex Factory ET time string (e.g. '8:30am') to Tehran HH:MM"""
-    if not time_str or not time_str.strip():
-        return "تمام روز"
-    try:
-        dt_et = datetime.strptime(
-            f"{event_date} {time_str.strip()}", "%Y-%m-%d %I:%M%p"
-        ).replace(tzinfo=ET_TZ)
-        return dt_et.astimezone(TEHRAN_TZ).strftime("%H:%M")
-    except Exception:
-        return time_str
+def format_event_line(event, event_time_local):
+    emoji = IMPACT_EMOJI.get(event["impact"], "")
+    title = event.get("title", "")
+    forecast = event.get("forecast") or "—"
+    previous = event.get("previous") or "—"
+    time_str = event_time_local.strftime("%H:%M")
+    return (
+        f"{emoji} <b>{time_str}</b> - {title}\n"
+        f"   📊 پیش‌بینی: {forecast} | 📌 قبلی: {previous}"
+    )
 
+def main():
+    resp = requests.get(FEED_URL, timeout=20)
+    resp.raise_for_status()
+    events = resp.json()
 
-async def fetch_news() -> list[dict]:
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(FF_RSS_URL)
-        resp.raise_for_status()
+    today_tehran = datetime.now(TEHRAN_TZ).date()
 
-    root = ET.fromstring(resp.text)
-    today = datetime.now(TEHRAN_TZ).date()
-    events = []
+    todays_events = []
+    for event in events:
+        if event.get("country") != "USD":
+            continue
+        if event.get("impact") not in ("High", "Medium"):
+            continue
 
-    for item in root.findall(".//event"):
+        raw_date = event.get("date")
+        if not raw_date:
+            continue
         try:
-            currency = (item.findtext("country") or "").strip()
-            impact   = (item.findtext("impact")  or "").strip()
-            if currency != CURRENCY_FILTER or impact not in IMPACT_FILTER:
-                continue
+            event_time = datetime.fromisoformat(raw_date)
+        except ValueError:
+            continue
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=timezone.utc)
 
-            date_str = (item.findtext("date") or "").strip()
-            time_str = (item.findtext("time") or "").strip()
-            title    = (item.findtext("title")    or "").strip()
-            forecast = (item.findtext("forecast") or "—").strip()
-            previous = (item.findtext("previous") or "—").strip()
+        event_time_local = event_time.astimezone(TEHRAN_TZ)
+        if event_time_local.date() != today_tehran:
+            continue
 
-            # parse date
-            for fmt in ("%m-%d-%Y", "%Y-%m-%d"):
-                try:
-                    event_date = datetime.strptime(date_str, fmt).date()
-                    break
-                except ValueError:
-                    continue
-            else:
-                continue
+        todays_events.append((event_time_local, event))
 
-            if event_date != today:
-                continue
+    todays_events.sort(key=lambda x: x[0])
 
-            tehran_time = to_tehran_time(time_str, event_date)
-
-            events.append({
-                "title":    title,
-                "time":     tehran_time,
-                "time_raw": time_str,
-                "impact":   impact,
-                "forecast": forecast,
-                "previous": previous,
-            })
-        except Exception as e:
-            log.warning(f"Event parse error: {e}")
-
-    events.sort(key=lambda x: x["time_raw"])
-    return events
-
-
-def build_message(events: list[dict]) -> str:
-    now = datetime.now(TEHRAN_TZ)
-    weekday_map = {
-        "Monday": "دوشنبه", "Tuesday": "سه‌شنبه", "Wednesday": "چهارشنبه",
-        "Thursday": "پنج‌شنبه", "Friday": "جمعه",
-    }
-    weekday_fa = weekday_map.get(now.strftime("%A"), now.strftime("%A"))
-    date_fa = now.strftime("%Y/%m/%d")
-
-    lines = [
-        f"🇺🇸 *اخبار فارکس آمریکا — {weekday_fa} {date_fa}*",
-        "━━━━━━━━━━━━━━━━━━━",
-    ]
-
-    if not events:
-        lines.append("📭 امروز خبر مهمی برای USD وجود ندارد.")
+    if not todays_events:
+        message = "📅 امروز خبر مهم قرمز یا نارنجی دلاری در تقویم نیست."
     else:
-        for ev in events:
-            icon = "🔴" if ev["impact"] == "High" else "🟠"
-            lines.append(
-                f"{icon} *{ev['title']}*\n"
-                f"   🕐 `{ev['time']} تهران`  |  پیش‌بینی: `{ev['forecast']}`  |  قبلی: `{ev['previous']}`"
-            )
-            lines.append("")
+        header = f"📅 <b>اخبار USD امروز ({today_tehran.strftime('%Y-%m-%d')})</b>\n"
+        lines = [format_event_line(ev, t) for t, ev in todays_events]
+        message = header + "\n\n".join(lines)
 
-    lines.append("━━━━━━━━━━━━━━━━━━━")
-    lines.append("📊 [Forex Factory](https://www.forexfactory.com/calendar)")
-    return "\n".join(lines)
-
-
-async def send_daily_news():
-    log.info("Fetching news...")
-    try:
-        events = await fetch_news()
-        message = build_message(events)
-        bot = Bot(token=BOT_TOKEN)
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=message,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-        )
-        log.info(f"Sent {len(events)} events.")
-    except Exception as e:
-        log.error(f"Send error: {e}")
-
-
-async def scheduler():
-    log.info("Bot started...")
-    try:
-        bot = Bot(token=BOT_TOKEN)
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text="✅ ربات با موفقیت روشن شد و در حال کار است.",
-        )
-    except Exception as e:
-        log.error(f"Startup message error: {e}")
-
-    while True:
-        now = datetime.now(TEHRAN_TZ)
-        if now.weekday() < 5 and now.hour == SEND_HOUR and now.minute == SEND_MINUTE:
-            await send_daily_news()
-            await asyncio.sleep(61)
-        else:
-            await asyncio.sleep(30)
-
+    send_telegram(message)
+    print("پیام ارسال شد.")
 
 if __name__ == "__main__":
-    asyncio.run(scheduler())
-    
+    main()
